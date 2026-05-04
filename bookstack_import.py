@@ -19,22 +19,16 @@ Directory Structure:
 
 Usage:
   # Import
-  python bookstack.py import --url https://bookstack.example.com \\
+  python bookstack.py import --url https://bookstack.example.com \
       --token-id YOUR_ID --token-secret YOUR_SECRET --dir ./docs
 
-  # Import (dry run)
-  python bookstack.py import --url ... --token-id ... --token-secret ... \\
-      --dir ./docs --dry-run
+  # Import a specific folder as a book
+  python bookstack.py import --url ... --token-id ... --token-secret ... \
+      --dir ./my-docs --book "My Book"
 
   # Export everything
-  python bookstack.py export --url https://bookstack.example.com \\
+  python bookstack.py export --url https://bookstack.example.com \
       --token-id YOUR_ID --token-secret YOUR_SECRET --dir ./docs-export
-
-  # Export a specific shelf only
-  python bookstack.py export ... --shelf "My Shelf"
-
-  # Export a specific book only
-  python bookstack.py export ... --book "My Book"
 
 Requirements:
   pip install requests
@@ -49,7 +43,7 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import requests
 
@@ -130,8 +124,19 @@ def slugify(name: str) -> str:
 def infer_name(path: Path) -> str:
     """Convert a file/directory name to a human-readable title."""
     name = path.stem if path.is_file() else path.name
-    name = re.sub(r"[-_]+", " ", name)
-    name = re.sub(r"^\d+[\.\s]+", "", name)
+    
+    # 1. Strip leading numbering: "01. Title", "01 Title", "01-Title"
+    # But only if it's 1-3 digits (to avoid stripping years) or followed by a dot.
+    name = re.sub(r"^\d+\.\s*", "", name)
+    name = re.sub(r"^\d{1,3}[-_\s]+", "", name)
+
+    # 2. Replace underscores with spaces
+    name = name.replace("_", " ")
+    
+    # 3. Replace dashes with spaces UNLESS they are between two digits (like a date)
+    # This turns "My-Page" into "My Page" but keeps "2022-10"
+    name = re.sub(r"-(?!\d)|(?<!\d)-", " ", name)
+    
     return name.strip().title()
 
 
@@ -361,7 +366,9 @@ def rewrite_image_links(markdown: str, page_dir: Path, client: BookStackClient, 
         alt, ref = m.group(1), m.group(2)
         if ref.startswith(("http://", "https://", "//", "data:")):
             return m.group(0)
-        img_path = (page_dir / ref).resolve()
+        # Unquote URL-encoded characters like %20
+        decoded_ref = unquote(ref)
+        img_path = (page_dir / decoded_ref).resolve()
         if not img_path.exists():
             log.warning("      Image not found, skipping: %s", img_path)
             return m.group(0)
@@ -407,6 +414,27 @@ def process_page(md_file: Path, book_id: int, chapter_id: int | None, client: Bo
     time.sleep(0.1)
 
 
+def process_book(book_dir: Path, book_name: str, client: BookStackClient, shelf_id: int | None):
+    log.info("Book: %s", book_name)
+    book = client.get_or_create_book(book_name, shelf_id)
+    book_id: int = book.get("id", 0)
+
+    for entry in sorted(book_dir.iterdir()):
+        if entry.name.startswith("."):
+            continue
+        if entry.is_dir() and entry.name.lower() == "attachments":
+            continue
+        if entry.is_dir():
+            chapter_name = infer_name(entry)
+            log.info("  Chapter: %s", chapter_name)
+            chapter = client.get_or_create_chapter(chapter_name, book_id)
+            chapter_id: int = chapter.get("id", 0)
+            for md_file in sorted(entry.glob("*.md")):
+                process_page(md_file, book_id, chapter_id, client)
+        elif entry.suffix.lower() == ".md":
+            process_page(entry, book_id, None, client)
+
+
 def process_directory(root: Path, client: BookStackClient, shelf_id: int | None):
     if not root.is_dir():
         log.error("Root path is not a directory: %s", root)
@@ -419,27 +447,7 @@ def process_directory(root: Path, client: BookStackClient, shelf_id: int | None)
 
     for book_dir in book_dirs:
         book_name = infer_name(book_dir)
-        log.info("Book: %s", book_name)
-        book = client.get_or_create_book(book_name, shelf_id)
-        book_id: int = book.get("id", 0)
-
-        for entry in sorted(book_dir.iterdir()):
-            if entry.name.startswith("."):
-                continue
-            if entry.is_dir() and entry.name.lower() == "attachments":
-                continue
-            if entry.is_dir():
-                chapter_name = infer_name(entry)
-                log.info("  Chapter: %s", chapter_name)
-                chapter = client.get_or_create_chapter(chapter_name, book_id)
-                chapter_id: int = chapter.get("id", 0)
-                for md_file in sorted(entry.glob("*.md")):
-                    process_page(md_file, book_id, chapter_id, client)
-            elif entry.suffix.lower() == ".md":
-                process_page(entry, book_id, None, client)
-
-
-
+        process_book(book_dir, book_name, client, shelf_id)
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +724,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(imp)
     imp.add_argument("--shelf", default=None,
                      help="Assign all imported books to this shelf (created if needed)")
+    imp.add_argument("--book", default=None,
+                     help="Import directly into this book (by name). If omitted, subdirectories are treated as books.")
     imp.add_argument("--dry-run", action="store_true",
                      help="Preview actions without modifying BookStack")
 
@@ -760,7 +770,10 @@ def main():
             shelf = client.get_or_create_shelf(args.shelf)
             shelf_id = shelf.get("id")
 
-        process_directory(Path(args.dir), client, shelf_id)
+        if args.book:
+            process_book(Path(args.dir), args.book, client, shelf_id)
+        else:
+            process_directory(Path(args.dir), client, shelf_id)
         log.info("Import complete.")
 
     # ---- export -----------------------------------------------------------
